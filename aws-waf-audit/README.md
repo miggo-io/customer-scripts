@@ -9,6 +9,31 @@ The script makes **no writes** to AWS. It only calls `List*`, `Get*`, and
 
 ---
 
+## Executive summary
+
+The script produces a complete, point-in-time inventory of your AWS WAF
+configuration as a single JSON report (plus a human-readable stdout summary).
+It scans **every AWS region** and the global **CloudFront** scope, and for
+each WAFv2 Web ACL it captures:
+
+- **The ACL itself** — name, ARN, scope (`REGIONAL` vs `CLOUDFRONT`), region.
+- **Every rule inside the ACL** — priority, action (`BLOCK` / `ALLOW` /
+  `COUNT` / `CAPTCHA` / `CHALLENGE`), type (custom / rate-based / managed),
+  and the **full rule expression** in JSON (the same definition shown in the
+  AWS console "Rule JSON" view).
+- **Every resource the ACL is currently protecting** — Application Load
+  Balancers, API Gateway stages, AppSync APIs, Cognito User Pools, App Runner
+  services, Verified Access instances, and CloudFront distributions, each by
+  ARN.
+- *Optionally* (`--include-stats`): per-rule and per-ACL CloudWatch traffic
+  counters (blocked / allowed / counted requests) for the last 24 hours.
+
+Typical uses: WAF coverage audits, finding unattached or misconfigured ACLs,
+reviewing rule effectiveness, and producing a portable artifact for security
+review. The script is **read-only** — no changes are made to AWS.
+
+---
+
 ## What the script pulls
 
 For every WAFv2 Web ACL in your account (both `REGIONAL` and `CLOUDFRONT` scopes,
