@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["boto3>=1.34"]
+# ///
 """AWS WAF read-only audit.
 
 Inventories every WAFv2 Web ACL in an AWS account, the rules inside each ACL,

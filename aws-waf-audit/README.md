@@ -66,16 +66,31 @@ already reports natively — no new metrics are produced.
 
 ## Prerequisites
 
-- **Python 3.9+**
-- **Dependencies** (one package — `boto3`):
-  ```bash
-  pip install -r requirements.txt
-  ```
-- **AWS credentials** with the read-only permissions listed below, available
-  via any standard mechanism:
-  - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`)
-  - Shared config / credentials file (`~/.aws/credentials`, optionally with `--profile`)
-  - EC2 instance profile / ECS task role / IAM Identity Center
+The script is **fully self-contained** — its sole dependency (`boto3`) is
+declared inline using [PEP 723](https://peps.python.org/pep-0723/) inline
+script metadata.
+
+**Recommended runtime: [`uv`](https://docs.astral.sh/uv/)** — it reads the
+inline metadata, creates an isolated environment, installs `boto3`, and
+runs the script. No virtualenv, no `pip install`, no pollution of the
+system Python.
+
+- Install uv (one-liner): `curl -LsSf https://astral.sh/uv/install.sh | sh`
+  (or `brew install uv`, or `pip install uv`).
+- The script declares `requires-python = ">=3.10"` — uv will fetch a
+  matching interpreter automatically if one isn't installed.
+
+**Fallback: plain Python.** If uv isn't an option, install boto3 manually
+into your Python 3.10+ environment:
+
+```bash
+pip install "boto3>=1.34"
+```
+
+**AWS credentials** — required either way, available via any standard mechanism:
+- Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`)
+- Shared config / credentials file (`~/.aws/credentials`, optionally with `--profile`)
+- EC2 instance profile / ECS task role / IAM Identity Center
 
 ---
 
@@ -119,24 +134,36 @@ the script with `--include-stats`; otherwise it can be omitted.
 
 ## Usage
 
-```bash
-# Default: scan every opted-in region, write JSON next to the script
-python audit.py
+The script has a `uv` shebang, so once it's executable you can run it directly:
 
+```bash
+chmod +x audit.py        # only needed once
+./audit.py               # default: scan every opted-in region
+
+# Equivalent explicit form
+uv run audit.py
+
+# Plain-Python fallback (only after `pip install boto3`)
+python audit.py
+```
+
+Common invocations:
+
+```bash
 # Use a named AWS profile
-python audit.py --profile my-aws-profile
+./audit.py --profile my-aws-profile
 
 # Limit to specific regions (CLOUDFRONT scope is always scanned in us-east-1)
-python audit.py --regions us-east-1,eu-west-1
+./audit.py --regions us-east-1,eu-west-1
 
 # Include 24h CloudWatch traffic counters
-python audit.py --include-stats
+./audit.py --include-stats
 
 # Custom lookback (e.g., last 7 days)
-python audit.py --include-stats --lookback-hours 168
+./audit.py --include-stats --lookback-hours 168
 
 # Custom output path
-python audit.py --output /tmp/waf-audit.json
+./audit.py --output /tmp/waf-audit.json
 ```
 
 ### CLI flags

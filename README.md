@@ -6,14 +6,17 @@ own infrastructure.
 
 Every script in this repo is intended to be:
 
-- **Self-contained** — one folder, one entry-point script, a small
-  `requirements.txt`, and a customer-facing `README.md`.
+- **Self-contained** — single-file scripts using
+  [PEP 723](https://peps.python.org/pep-0723/) inline dependency metadata
+  so the script is runnable end-to-end with `uv run` (or `./script.py` via
+  the `uv` shebang). No `requirements.txt`, no virtualenv setup.
 - **Read-only** — no writes to customer infrastructure unless explicitly
   scoped and documented.
 - **Auditable** — minimal dependencies, clear required IAM / RBAC, and an
   explicit list of what data is collected (and what isn't).
-- **Portable** — should run on a stock Python install with `pip install -r
-  requirements.txt`, no internal Miggo packages.
+- **Portable** — runs on any machine with [`uv`](https://docs.astral.sh/uv/)
+  (or, as a fallback, a stock Python with the inline-declared deps installed
+  manually). No internal Miggo packages.
 
 ## Scripts
 
@@ -29,9 +32,19 @@ When adding a new script, create a folder at the repo root with:
 <script-name>/
 ├── README.md           # customer-facing: what it does, prerequisites,
 │                       # required permissions, usage, output, troubleshooting
-├── requirements.txt    # third-party dependencies, pinned to a minimum version
-└── <entry-point>.py    # single-file script, runnable as `python <entry-point>.py`
+└── <entry-point>.py    # single-file script with PEP 723 inline metadata
+                        # and `#!/usr/bin/env -S uv run --script` shebang
+```
+
+Inline metadata block (top of every script):
+
+```python
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["<pkg>>=<min-version>", ...]
+# ///
 ```
 
 Keep it simple — one script per folder, no shared utilities across scripts.
-Customers receive a single folder, not the whole repo.
+Customers receive a single folder (or single file), not the whole repo.
