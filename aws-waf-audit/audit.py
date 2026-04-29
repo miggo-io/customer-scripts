@@ -163,7 +163,13 @@ def list_regional_resources(wafv2, acl_arn: str) -> list[str]:
 
 
 def list_cloudfront_associations(session: boto3.Session) -> dict[str, list[str]]:
-    """Map CloudFront WebACL id -> list of distribution ARNs."""
+    """Map CloudFront WebACLId field -> list of distribution ARNs.
+
+    Note: for WAFv2 ACLs the `WebACLId` field on a CloudFront distribution is
+    the full WAF ARN (not the bare GUID). We key the dict by that field
+    verbatim; callers should look it up by ACL ARN first, then fall back to
+    the ACL ID for any legacy WAF Classic associations.
+    """
     cf = session.client("cloudfront")
     paginator = cf.get_paginator("list_distributions")
     by_acl: dict[str, list[str]] = {}
@@ -267,7 +273,9 @@ def audit_scope(
         if scope == "REGIONAL":
             acl.associated_resources = list_regional_resources(wafv2, acl.arn)
         else:
-            acl.associated_resources = cf_associations.get(acl.id, [])
+            acl.associated_resources = cf_associations.get(
+                acl.arn, cf_associations.get(acl.id, [])
+            )
 
         if include_stats and cw is not None:
             attach_rule_stats(cw, acl, lookback_hours)
