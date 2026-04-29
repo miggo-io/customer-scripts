@@ -28,6 +28,11 @@ each WAFv2 Web ACL it captures:
 - *Optionally* (`--include-stats`): per-rule and per-ACL CloudWatch traffic
   counters (blocked / allowed / counted requests) for the last 24 hours.
 
+The report also exposes a top-level **`rule_expressions`** array — a flat
+list of every rule from every ACL with its full statement and identifying
+context — for cases where you want to scan or analyze rules without
+traversing the nested ACL tree.
+
 Typical uses: WAF coverage audits, finding unattached or misconfigured ACLs,
 reviewing rule effectiveness, and producing a portable artifact for security
 review. The script is **read-only** — no changes are made to AWS.
@@ -239,9 +244,29 @@ Common invocations:
       "total_blocked": null,
       "total_allowed": null
     }
+  ],
+  "rule_expressions": [
+    {
+      "acl_name": "my-web-acl",
+      "acl_arn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/...",
+      "acl_scope": "REGIONAL",
+      "acl_region": "us-east-1",
+      "rule_name": "block-bad-ips",
+      "rule_priority": 1,
+      "rule_action": "BLOCK",
+      "rule_type": "regular",
+      "metric_name": "block-bad-ips-metric",
+      "statement": { "IPSetReferenceStatement": { "ARN": "..." } }
+    }
   ]
 }
 ```
+
+The top-level `rule_expressions` field is a flat list of every rule across
+every ACL — handy when you want to scan, grep, or pipe rule definitions
+without walking the `web_acls[].rules[]` tree. Each entry carries enough
+context (ACL name/ARN/scope, rule name/priority/action) to identify itself
+on its own.
 
 When `--include-stats` is set, the `blocked`, `allowed`, `counted`,
 `total_blocked`, and `total_allowed` fields are populated with integer counts.
