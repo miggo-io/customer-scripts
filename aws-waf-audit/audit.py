@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["boto3>=1.34"]
+# ///
 """AWS WAF read-only audit.
 
 Inventories every WAFv2 Web ACL in an AWS account, the rules inside each ACL,
@@ -316,6 +320,28 @@ def build_report(
     return acls
 
 
+def flatten_rule_expressions(acls: list[WafAcl]) -> list[dict]:
+    """Flatten every rule across every ACL into a single list with context."""
+    flat: list[dict] = []
+    for acl in acls:
+        for rule in acl.rules:
+            flat.append(
+                {
+                    "acl_name": acl.name,
+                    "acl_arn": acl.arn,
+                    "acl_scope": acl.scope,
+                    "acl_region": acl.region,
+                    "rule_name": rule.name,
+                    "rule_priority": rule.priority,
+                    "rule_action": rule.action,
+                    "rule_type": rule.rule_type,
+                    "metric_name": rule.metric_name,
+                    "statement": rule.statement,
+                }
+            )
+    return flat
+
+
 def print_summary(acls: list[WafAcl], include_stats: bool) -> None:
     print()
     print("=" * 72)
@@ -388,12 +414,20 @@ def main() -> int:
 
     acls = build_report(session, regions, args.include_stats, args.lookback_hours)
 
+    web_acls_view: list[dict] = []
+    for acl in acls:
+        acl_dict = asdict(acl)
+        for rule_dict in acl_dict["rules"]:
+            rule_dict.pop("statement", None)
+        web_acls_view.append(acl_dict)
+
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "account_id": session.client("sts").get_caller_identity()["Account"],
         "include_stats": args.include_stats,
         "lookback_hours": args.lookback_hours if args.include_stats else None,
-        "web_acls": [asdict(a) for a in acls],
+        "web_acls": web_acls_view,
+        "rule_expressions": flatten_rule_expressions(acls),
     }
     with open(args.output, "w") as f:
         json.dump(report, f, indent=2, default=str)
