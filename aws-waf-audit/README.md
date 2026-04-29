@@ -59,8 +59,12 @@ For each rule:
   - `rate_based` — rate-limit rule
   - `managed` — AWS or marketplace Managed Rule Group
 - **CloudWatch metric name** (from `VisibilityConfig`)
-- **Statement** — the full rule definition as returned by `wafv2:GetWebACL`
-  (the same JSON you'd see in the AWS console "Rule JSON" view)
+
+The **full rule expression** (the verbatim `Statement` from `wafv2:GetWebACL`,
+identical to the AWS console "Rule JSON" view) lives in the top-level
+**`rule_expressions`** array — see [Output](#output) below. Keeping it in
+exactly one place avoids duplication and makes the nested ACL view easier
+to scan.
 
 ### Attached resources (ACL → resource mapping)
 The AWS resources that each Web ACL is currently protecting:
@@ -242,7 +246,6 @@ Common invocations:
           "action": "BLOCK",
           "rule_type": "regular",
           "metric_name": "block-bad-ips-metric",
-          "statement": { "IPSetReferenceStatement": { "ARN": "..." } },
           "blocked": null,
           "allowed": null,
           "counted": null
@@ -273,10 +276,10 @@ Common invocations:
 ```
 
 The top-level `rule_expressions` field is a flat list of every rule across
-every ACL — handy when you want to scan, grep, or pipe rule definitions
-without walking the `web_acls[].rules[]` tree. Each entry carries enough
-context (ACL name/ARN/scope, rule name/priority/action) to identify itself
-on its own.
+every ACL — and is **the only place the rule expression (`statement`) lives**.
+Each entry carries enough context (ACL name/ARN/scope, rule name/priority/
+action, type, metric name) to be self-contained, so you can scan, grep, or
+pipe rule definitions without walking the nested `web_acls[].rules[]` tree.
 
 When `--include-stats` is set, the `blocked`, `allowed`, `counted`,
 `total_blocked`, and `total_allowed` fields are populated with integer counts.
