@@ -97,8 +97,18 @@ already reports natively — no new metrics are produced.
 ## Prerequisites
 
 The script is **fully self-contained** — its sole dependency (`boto3`) is
-declared inline using [PEP 723](https://peps.python.org/pep-0723/) inline
-script metadata.
+declared inline at the top of `audit.py` using [PEP 723](https://peps.python.org/pep-0723/)
+inline script metadata:
+
+```python
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["boto3>=1.34"]
+# ///
+```
+
+That's the entire dependency surface. Feel free to inspect it before running.
 
 **Recommended runtime: [`uv`](https://docs.astral.sh/uv/)** — it reads the
 inline metadata, creates an isolated environment, installs `boto3`, and
@@ -273,16 +283,15 @@ When `--include-stats` is set, the `blocked`, `allowed`, `counted`,
 
 ### Stdout summary
 
-A grouped, human-readable summary is printed during and after the scan, e.g.:
+A grouped, human-readable summary is printed during and after the scan.
+
+**Without `--include-stats`** (default — config-only audit):
 
 ```
 Scanning CLOUDFRONT scope (us-east-1)
   CLOUDFRONT / us-east-1: 1 ACL(s)
     - cf-acl (4 rules, 2 attached resources)
 Scanning REGIONAL scope across 17 regions
-  REGIONAL / us-east-1: 2 ACL(s)
-    - alb-acl (6 rules, 1 attached resources)
-    - unattached-acl (2 rules, 0 attached resources)
 ...
 
 ========================================================================
@@ -295,7 +304,22 @@ AWS WAF Audit Summary  (3 Web ACL(s))
     - [  0] NONE  managed    AWS-AWSManagedRulesCommonRuleSet
     - [  1] BLOCK regular    block-bad-ips
     - [  2] COUNT rate_based rate-limit-rule
-    ...
+  Attached resources (2):
+    - arn:aws:cloudfront::123456789012:distribution/EXXXXXX
+    - arn:aws:cloudfront::123456789012:distribution/EYYYYYY
+```
+
+**With `--include-stats`** — each rule line gains trailing CloudWatch
+counters and an extra `Totals (24h)` line is printed per ACL:
+
+```
+[CLOUDFRONT] cf-acl  (us-east-1)
+  ARN: arn:aws:wafv2:global:.../webacl/...
+  Rules: 4
+    - [  0] NONE  managed    AWS-AWSManagedRulesCommonRuleSet  blocked=0 allowed=12345 counted=0
+    - [  1] BLOCK regular    block-bad-ips                     blocked=87 allowed=0 counted=0
+    - [  2] COUNT rate_based rate-limit-rule                   blocked=0 allowed=0 counted=14
+  Totals (24h): blocked=87 allowed=12345
   Attached resources (2):
     - arn:aws:cloudfront::123456789012:distribution/EXXXXXX
     - arn:aws:cloudfront::123456789012:distribution/EYYYYYY
@@ -307,6 +331,7 @@ AWS WAF Audit Summary  (3 Web ACL(s))
 
 | Symptom | Cause / Fix |
 |---------|-------------|
+| `env: uv: No such file or directory` (or `uv: command not found`) | uv isn't installed or isn't on `PATH`. Install it (`brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh \| sh`), or use the plain-Python fallback (`pip install boto3 && python audit.py`). |
 | `Unable to locate credentials` | No credentials in env / config. Run `aws configure` or set `AWS_PROFILE`. |
 | `AccessDenied` on `wafv2:*` | The principal is missing one of the IAM actions above. |
 | `ThrottlingException` warnings on stderr | Benign — the script logs the warning, treats the affected metric as 0, and continues. |
