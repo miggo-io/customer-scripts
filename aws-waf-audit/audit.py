@@ -18,6 +18,7 @@ Required IAM permissions (all read-only):
   - ec2:DescribeRegions
   - wafv2:ListWebACLs
   - wafv2:GetWebACL
+  - wafv2:GetRuleGroup
   - wafv2:ListResourcesForWebACL
   - cloudfront:ListDistributions
   - cloudwatch:GetMetricStatistics            (only with --include-stats)
@@ -62,6 +63,7 @@ class WafRule:
     rule_type: str
     metric_name: str
     statement: dict
+    child_rules: list["WafRule"] = field(default_factory=list)
     blocked: int | None = None
     allowed: int | None = None
     counted: int | None = None
@@ -80,6 +82,16 @@ class WafAcl:
     total_allowed: int | None = None
 
 
+def classify_rule_type(statement: dict) -> str:
+    if "ManagedRuleGroupStatement" in statement:
+        return "managed"
+    if "RuleGroupReferenceStatement" in statement:
+        return "custom_rule_group"
+    if "RateBasedStatement" in statement:
+        return "rate_based"
+    return "regular"
+
+
 def parse_rule(raw: dict) -> WafRule:
     statement = raw.get("Statement", {}) or {}
     action_dict = raw.get("Action", {}) or {}
@@ -90,13 +102,6 @@ def parse_rule(raw: dict) -> WafRule:
         metric_name = visibility["MetricName"]
     else:
         metric_name = raw.get("Name", "")
-
-    if "ManagedRuleGroupStatement" in statement or override_action:
-        rule_type = "managed"
-    elif "RateBasedStatement" in statement:
-        rule_type = "rate_based"
-    else:
-        rule_type = "regular"
 
     if action_dict:
         action = next(iter(action_dict.keys()), "UNKNOWN").upper()
@@ -109,10 +114,43 @@ def parse_rule(raw: dict) -> WafRule:
         name=raw.get("Name", ""),
         priority=raw.get("Priority", 0),
         action=action,
-        rule_type=rule_type,
+        rule_type=classify_rule_type(statement),
         metric_name=metric_name,
         statement=statement,
     )
+
+
+def parse_rule_group_arn(arn: str) -> tuple[str, str, str]:
+    """Return (name, scope, id) from a WAFv2 rule group ARN."""
+    resource = arn.split(":", 5)[5]
+    scope_part, _, name, rule_group_id = resource.split("/", 3)
+    scope = "CLOUDFRONT" if scope_part == "global" else "REGIONAL"
+    return name, scope, rule_group_id
+
+
+def fetch_rule_group_rules(wafv2, arn: str) -> list[WafRule]:
+    name, scope, rule_group_id = parse_rule_group_arn(arn)
+    response = wafv2.get_rule_group(Name=name, Scope=scope, Id=rule_group_id)
+    raw_rules = response.get("RuleGroup", {}).get("Rules", [])
+    return [parse_rule(r) for r in raw_rules]
+
+
+def expand_custom_rule_groups(wafv2, rules: list[WafRule]) -> None:
+    """Fetch child rules for custom rule group references (one level only)."""
+    for rule in rules:
+        if rule.rule_type != "custom_rule_group":
+            continue
+        ref = rule.statement.get("RuleGroupReferenceStatement", {})
+        arn = ref.get("ARN")
+        if not arn:
+            continue
+        try:
+            rule.child_rules = fetch_rule_group_rules(wafv2, arn)
+        except (ClientError, BotoCoreError) as exc:
+            print(
+                f"    warning: get_rule_group({rule.name}): {exc}",
+                file=sys.stderr,
+            )
 
 
 def discover_regions(session: boto3.Session) -> list[str]:
@@ -143,7 +181,9 @@ def list_web_acls(wafv2, scope: str) -> list[dict]:
 def fetch_acl_rules(wafv2, name: str, acl_id: str, scope: str) -> list[WafRule]:
     response = wafv2.get_web_acl(Name=name, Scope=scope, Id=acl_id)
     raw_rules = response.get("WebACL", {}).get("Rules", [])
-    return [parse_rule(r) for r in raw_rules]
+    rules = [parse_rule(r) for r in raw_rules]
+    expand_custom_rule_groups(wafv2, rules)
+    return rules
 
 
 def list_regional_resources(wafv2, acl_arn: str) -> list[str]:
@@ -320,25 +360,32 @@ def build_report(
     return acls
 
 
+def rule_expression_entry(acl: WafAcl, rule: WafRule, *, parent_rule_name: str | None) -> dict:
+    entry = {
+        "acl_name": acl.name,
+        "acl_arn": acl.arn,
+        "acl_scope": acl.scope,
+        "acl_region": acl.region,
+        "rule_name": rule.name,
+        "rule_priority": rule.priority,
+        "rule_action": rule.action,
+        "rule_type": rule.rule_type,
+        "metric_name": rule.metric_name,
+        "statement": rule.statement,
+    }
+    if parent_rule_name is not None:
+        entry["parent_rule_name"] = parent_rule_name
+    return entry
+
+
 def flatten_rule_expressions(acls: list[WafAcl]) -> list[dict]:
     """Flatten every rule across every ACL into a single list with context."""
     flat: list[dict] = []
     for acl in acls:
         for rule in acl.rules:
-            flat.append(
-                {
-                    "acl_name": acl.name,
-                    "acl_arn": acl.arn,
-                    "acl_scope": acl.scope,
-                    "acl_region": acl.region,
-                    "rule_name": rule.name,
-                    "rule_priority": rule.priority,
-                    "rule_action": rule.action,
-                    "rule_type": rule.rule_type,
-                    "metric_name": rule.metric_name,
-                    "statement": rule.statement,
-                }
-            )
+            flat.append(rule_expression_entry(acl, rule, parent_rule_name=None))
+            for child in rule.child_rules:
+                flat.append(rule_expression_entry(acl, child, parent_rule_name=rule.name))
     return flat
 
 
@@ -361,8 +408,13 @@ def print_summary(acls: list[WafAcl], include_stats: bool) -> None:
                 )
             print(
                 f"    - [{rule.priority:>3}] {rule.action:<5} "
-                f"{rule.rule_type:<10} {rule.name}{stats}"
+                f"{rule.rule_type:<18} {rule.name}{stats}"
             )
+            for child in rule.child_rules:
+                print(
+                    f"        - [{child.priority:>3}] {child.action:<5} "
+                    f"{child.rule_type:<18} {child.name}"
+                )
         if include_stats and acl.total_blocked is not None:
             print(
                 f"  Totals (24h): blocked={acl.total_blocked} "
@@ -419,6 +471,8 @@ def main() -> int:
         acl_dict = asdict(acl)
         for rule_dict in acl_dict["rules"]:
             rule_dict.pop("statement", None)
+            for child_dict in rule_dict.get("child_rules") or []:
+                child_dict.pop("statement", None)
         web_acls_view.append(acl_dict)
 
     report = {
