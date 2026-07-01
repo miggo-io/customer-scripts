@@ -82,6 +82,18 @@ The AWS resources that each Web ACL is currently protecting:
 
 ACLs with no attached resources are explicitly flagged in the output.
 
+With `--resolve-dns`, each attached resource also includes:
+- **`aws_hostname`** — the AWS endpoint (e.g. `*.cloudfront.net`, `*.elb.amazonaws.com`, `*.execute-api.*.amazonaws.com`)
+- **`aliases`** — customer-facing alternate domain names where available (primarily CloudFront CNAMEs; Cognito custom domains)
+
+Custom domains pointing at ALBs via Route53 are **not** resolved (ELB does not expose them).
+
+### Optional: DNS resolution (`--resolve-dns`)
+Resolves hostnames for attached resources using existing CloudFront list data
+(no extra CloudFront calls) plus batched regional `Describe*` calls for ALBs,
+API Gateway stages (default execute-api hostname parsed from the ARN), AppSync,
+App Runner, Cognito, and Verified Access endpoints.
+
 ### Optional: traffic counters (`--include-stats`)
 When this flag is set, the script also pulls **CloudWatch counters** for the
 last 24 hours (configurable with `--lookback-hours`):
@@ -94,8 +106,10 @@ already reports natively — no new metrics are produced.
 ### What the script does **not** collect
 - No request bodies, headers, IP addresses, or any sampled requests
 - No customer traffic data beyond aggregated counters (only when `--include-stats`)
-- No data from any service other than WAFv2, CloudFront, EC2 (regions), STS
-  (account ID), Service Quotas (WCU limits), and CloudWatch (only with `--include-stats`)
+- No data from any service other than WAFv2, CloudFront, EC2 (regions and,
+  with `--resolve-dns`, Verified Access endpoints), ELBv2, API Gateway (ARN
+  parsing only), AppSync, App Runner, Cognito, STS (account ID), Service Quotas
+  (WCU limits), and CloudWatch (only with `--include-stats`)
 - No writes, modifications, or configuration changes of any kind
 
 ---
@@ -168,6 +182,17 @@ All actions are read-only. Minimal policy:
         "cloudwatch:GetMetricStatistics"
       ],
       "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "appsync:GetGraphqlApi",
+        "apprunner:DescribeService",
+        "cognito-idp:DescribeUserPool",
+        "ec2:DescribeVerifiedAccessEndpoints"
+      ],
+      "Resource": "*"
     }
   ]
 }
@@ -175,6 +200,9 @@ All actions are read-only. Minimal policy:
 
 The `cloudwatch:GetMetricStatistics` permission is only required if you run
 the script with `--include-stats`; otherwise it can be omitted.
+
+The second optional statement is only required with `--resolve-dns`. API Gateway
+default hostnames are derived from the resource ARN and need no extra IAM action.
 
 > **Tip:** the AWS-managed policy `ReadOnlyAccess` already covers all of these.
 
@@ -215,6 +243,9 @@ Common invocations:
 
 # Custom output path
 ./audit.py --output /tmp/waf-audit.json
+
+# Resolve DNS hostnames for attached resources
+./audit.py --resolve-dns
 ```
 
 ### CLI flags
@@ -226,6 +257,7 @@ Common invocations:
 | `--regions REGIONS` | Comma-separated regions for `REGIONAL` scope (default: all opted-in regions) |
 | `--output PATH` | Path for the JSON report (default: `aws_waf_audit_<UTC-timestamp>.json`) |
 | `--include-stats` | Also fetch per-rule CloudWatch traffic counters |
+| `--resolve-dns` | Resolve `aws_hostname` and CloudFront `aliases` for attached resources |
 | `--lookback-hours N` | Hours of CloudWatch history when `--include-stats` is set (default: 24) |
 
 ---
@@ -239,6 +271,7 @@ Common invocations:
   "generated_at": "2026-04-29T12:34:56+00:00",
   "account_id": "123456789012",
   "include_stats": false,
+  "resolve_dns": true,
   "lookback_hours": null,
   "web_acls": [
     {
@@ -262,7 +295,10 @@ Common invocations:
         }
       ],
       "associated_resources": [
-        "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/my-alb/..."
+        {
+          "arn": "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/my-alb/...",
+          "aws_hostname": "my-alb-1234567890.us-east-1.elb.amazonaws.com"
+        }
       ],
       "total_blocked": null,
       "total_allowed": null
@@ -294,6 +330,10 @@ pipe rule definitions without walking the nested `web_acls[].rules[]` tree.
 When `--include-stats` is set, the `blocked`, `allowed`, `counted`,
 `total_blocked`, and `total_allowed` fields are populated with integer counts.
 
+When `--resolve-dns` is set, each `associated_resources` entry is an object
+with at least `arn`, and optionally `aws_hostname` and `aliases`. Without the
+flag, entries contain only `arn`.
+
 ### Stdout summary
 
 A grouped, human-readable summary is printed during and after the scan.
@@ -319,8 +359,8 @@ AWS WAF Audit Summary  (3 Web ACL(s))
     - [  1] BLOCK regular    block-bad-ips
     - [  2] COUNT rate_based rate-limit-rule
   Attached resources (2):
-    - arn:aws:cloudfront::123456789012:distribution/EXXXXXX
-    - arn:aws:cloudfront::123456789012:distribution/EYYYYYY
+    - arn:aws:cloudfront::123456789012:distribution/EXXXXXX (d111111abcdef8.cloudfront.net; aliases: cdn.example.com)
+    - arn:aws:cloudfront::123456789012:distribution/EYYYYYY (d222222abcdef8.cloudfront.net)
 ```
 
 **With `--include-stats`** — each rule line gains trailing CloudWatch
@@ -336,8 +376,8 @@ counters and an extra `Totals (24h)` line is printed per ACL:
     - [  2] COUNT rate_based rate-limit-rule                   blocked=0 allowed=0 counted=14
   Totals (24h): blocked=87 allowed=12345
   Attached resources (2):
-    - arn:aws:cloudfront::123456789012:distribution/EXXXXXX
-    - arn:aws:cloudfront::123456789012:distribution/EYYYYYY
+    - arn:aws:cloudfront::123456789012:distribution/EXXXXXX (d111111abcdef8.cloudfront.net; aliases: cdn.example.com)
+    - arn:aws:cloudfront::123456789012:distribution/EYYYYYY (d222222abcdef8.cloudfront.net)
 ```
 
 ---
