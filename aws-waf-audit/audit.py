@@ -23,11 +23,6 @@ Required IAM permissions (all read-only):
   - cloudfront:ListDistributions
   - cloudwatch:GetMetricStatistics            (only with --include-stats)
   - service-quotas:ListServiceQuotas          (Web ACL WCU limit lookup)
-  - elasticloadbalancing:DescribeLoadBalancers (only with --resolve-dns)
-  - appsync:GetGraphqlApi                     (only with --resolve-dns)
-  - apprunner:DescribeService                 (only with --resolve-dns)
-  - cognito-idp:DescribeUserPool              (only with --resolve-dns)
-  - ec2:DescribeVerifiedAccessEndpoints       (only with --resolve-dns)
 
 Usage:
   python audit.py
@@ -35,7 +30,6 @@ Usage:
   python audit.py --regions us-east-1,eu-west-1 --include-stats
   python audit.py --default-region eu-west-1
   python audit.py --include-stats --lookback-hours 168
-  python audit.py --resolve-dns
 """
 
 from __future__ import annotations
@@ -43,7 +37,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -77,15 +70,6 @@ REGIONAL_RESOURCE_TYPES = [
     "VERIFIED_ACCESS_INSTANCE",
 ]
 
-ELB_DESCRIBE_BATCH_SIZE = 20
-
-
-@dataclass
-class AssociatedResource:
-    arn: str
-    aws_hostname: str | None = None
-    aliases: list[str] = field(default_factory=list)
-
 
 @dataclass
 class WafRule:
@@ -111,7 +95,7 @@ class WafAcl:
     capacity: int | None = None
     capacity_limit: int | None = None
     rules: list[WafRule] = field(default_factory=list)
-    associated_resources: list[AssociatedResource] = field(default_factory=list)
+    associated_resources: list[str] = field(default_factory=list)
     total_blocked: int | None = None
     total_allowed: int | None = None
 
@@ -265,17 +249,14 @@ def fetch_acl_details(
     return rules, web_acl.get("Capacity")
 
 
-def list_regional_resources(wafv2, acl_arn: str) -> list[AssociatedResource]:
-    resources: list[AssociatedResource] = []
+def list_regional_resources(wafv2, acl_arn: str) -> list[str]:
+    resources: list[str] = []
     for resource_type in REGIONAL_RESOURCE_TYPES:
         try:
             response = wafv2.list_resources_for_web_acl(
                 WebACLArn=acl_arn, ResourceType=resource_type
             )
-            resources.extend(
-                AssociatedResource(arn=arn)
-                for arn in response.get("ResourceArns", [])
-            )
+            resources.extend(response.get("ResourceArns", []))
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
             if code in {"WAFInvalidParameterException", "InvalidParameterValue"}:
@@ -288,231 +269,25 @@ def list_regional_resources(wafv2, acl_arn: str) -> list[AssociatedResource]:
     return resources
 
 
-def list_cloudfront_index(
-    session: boto3.Session,
-) -> tuple[dict[str, list[str]], dict[str, AssociatedResource]]:
-    """Map WebACLId -> distribution ARNs and distribution ARN -> DNS metadata."""
+def list_cloudfront_associations(session: boto3.Session) -> dict[str, list[str]]:
+    """Map CloudFront WebACLId field -> list of distribution ARNs.
+
+    Note: for WAFv2 ACLs the `WebACLId` field on a CloudFront distribution is
+    the full WAF ARN (not the bare GUID). We key the dict by that field
+    verbatim; callers should look it up by ACL ARN first, then fall back to
+    the ACL ID for any legacy WAF Classic associations.
+    """
     cf = session.client("cloudfront")
     paginator = cf.get_paginator("list_distributions")
     by_acl: dict[str, list[str]] = {}
-    by_arn: dict[str, AssociatedResource] = {}
     for page in paginator.paginate():
         items = page.get("DistributionList", {}).get("Items", []) or []
         for dist in items:
-            arn = dist["ARN"]
-            aliases = (dist.get("Aliases") or {}).get("Items") or []
-            by_arn[arn] = AssociatedResource(
-                arn=arn,
-                aws_hostname=dist.get("DomainName"),
-                aliases=list(aliases),
-            )
             web_acl_id = dist.get("WebACLId") or ""
             if not web_acl_id:
                 continue
-            by_acl.setdefault(web_acl_id, []).append(arn)
-    return by_acl, by_arn
-
-
-def resource_service(arn: str) -> str:
-    return arn.split(":")[2]
-
-
-def parse_apigateway_hostname(arn: str) -> str | None:
-    parts = arn.split(":", 5)
-    if len(parts) < 6 or parts[2] != "apigateway":
-        return None
-    region = parts[3]
-    resource = parts[5]
-    segments = resource.strip("/").split("/")
-    if len(segments) < 4 or segments[2] != "stages":
-        return None
-    api_id, stage = segments[1], segments[3]
-    host = f"{api_id}.execute-api.{region}.amazonaws.com"
-    return host if stage == "$default" else f"{host}/{stage}"
-
-
-def resolve_alb_dns(session: boto3.Session, region: str, resources: list[AssociatedResource]) -> None:
-    elbv2 = session.client("elbv2", region_name=region)
-    arns = [res.arn for res in resources]
-    for start in range(0, len(arns), ELB_DESCRIBE_BATCH_SIZE):
-        chunk = arns[start : start + ELB_DESCRIBE_BATCH_SIZE]
-        try:
-            response = elbv2.describe_load_balancers(LoadBalancerArns=chunk)
-        except (ClientError, BotoCoreError) as exc:
-            print(
-                f"    warning: describe_load_balancers({region}): {exc}",
-                file=sys.stderr,
-            )
-            continue
-        dns_by_arn = {
-            lb["LoadBalancerArn"]: lb.get("DNSName")
-            for lb in response.get("LoadBalancers", [])
-        }
-        for res in resources:
-            if res.arn in dns_by_arn:
-                res.aws_hostname = dns_by_arn[res.arn]
-
-
-def resolve_appsync_dns(
-    session: boto3.Session, region: str, resources: list[AssociatedResource]
-) -> None:
-    client = session.client("appsync", region_name=region)
-    for res in resources:
-        api_id = res.arn.rsplit("/", 1)[-1]
-        try:
-            response = client.get_graphql_api(apiId=api_id)
-        except (ClientError, BotoCoreError) as exc:
-            print(
-                f"    warning: get_graphql_api({api_id}, {region}): {exc}",
-                file=sys.stderr,
-            )
-            continue
-        uris = response.get("graphqlApi", {}).get("uris", {}) or {}
-        res.aws_hostname = uris.get("GRAPHQL") or uris.get("REALTIME")
-
-
-def resolve_apprunner_dns(
-    session: boto3.Session, region: str, resources: list[AssociatedResource]
-) -> None:
-    client = session.client("apprunner", region_name=region)
-    for res in resources:
-        try:
-            response = client.describe_service(ServiceArn=res.arn)
-        except (ClientError, BotoCoreError) as exc:
-            print(
-                f"    warning: describe_service({res.arn}): {exc}",
-                file=sys.stderr,
-            )
-            continue
-        res.aws_hostname = response.get("Service", {}).get("ServiceUrl")
-
-
-def resolve_cognito_dns(
-    session: boto3.Session, region: str, resources: list[AssociatedResource]
-) -> None:
-    client = session.client("cognito-idp", region_name=region)
-    for res in resources:
-        pool_id = res.arn.rsplit("/", 1)[-1]
-        try:
-            response = client.describe_user_pool(UserPoolId=pool_id)
-        except (ClientError, BotoCoreError) as exc:
-            print(
-                f"    warning: describe_user_pool({pool_id}, {region}): {exc}",
-                file=sys.stderr,
-            )
-            continue
-        pool = response.get("UserPool", {}) or {}
-        if pool.get("CustomDomain"):
-            res.aliases.append(pool["CustomDomain"])
-        domain_prefix = pool.get("Domain")
-        if domain_prefix:
-            res.aws_hostname = f"{domain_prefix}.auth.{region}.amazoncognito.com"
-
-
-def resolve_verified_access_dns(
-    session: boto3.Session, region: str, resources: list[AssociatedResource]
-) -> None:
-    ec2 = session.client("ec2", region_name=region)
-    for res in resources:
-        instance_id = res.arn.rsplit("/", 1)[-1]
-        try:
-            response = ec2.describe_verified_access_endpoints(
-                Filters=[
-                    {
-                        "Name": "verified-access-instance-id",
-                        "Values": [instance_id],
-                    }
-                ]
-            )
-        except (ClientError, BotoCoreError) as exc:
-            print(
-                f"    warning: describe_verified_access_endpoints"
-                f"({instance_id}, {region}): {exc}",
-                file=sys.stderr,
-            )
-            continue
-        domains: list[str] = []
-        for endpoint in response.get("VerifiedAccessEndpoints", []) or []:
-            domain = endpoint.get("DomainName") or endpoint.get("EndpointDomain")
-            if domain:
-                domains.append(domain)
-        if domains:
-            res.aws_hostname = domains[0]
-            res.aliases.extend(domains[1:])
-
-
-def resolve_apigateway_dns(resources: list[AssociatedResource]) -> None:
-    for res in resources:
-        res.aws_hostname = parse_apigateway_hostname(res.arn)
-
-
-def resolve_regional_resource_dns(
-    session: boto3.Session, region: str, resources: list[AssociatedResource]
-) -> None:
-    by_service: dict[str, list[AssociatedResource]] = defaultdict(list)
-    for res in resources:
-        by_service[resource_service(res.arn)].append(res)
-
-    if by_service["elasticloadbalancing"]:
-        resolve_alb_dns(session, region, by_service["elasticloadbalancing"])
-    if by_service["apigateway"]:
-        resolve_apigateway_dns(by_service["apigateway"])
-    if by_service["appsync"]:
-        resolve_appsync_dns(session, region, by_service["appsync"])
-    if by_service["apprunner"]:
-        resolve_apprunner_dns(session, region, by_service["apprunner"])
-    if by_service["cognito-idp"]:
-        resolve_cognito_dns(session, region, by_service["cognito-idp"])
-    if by_service["ec2"]:
-        resolve_verified_access_dns(session, region, by_service["ec2"])
-
-
-def apply_dns_resolution(
-    session: boto3.Session,
-    acls: list[WafAcl],
-    cf_by_arn: dict[str, AssociatedResource],
-) -> None:
-    """Fill aws_hostname / aliases on attached resources (mutates ACLs in place)."""
-    regional_by_region: dict[str, list[AssociatedResource]] = defaultdict(list)
-
-    for acl in acls:
-        resolved: list[AssociatedResource] = []
-        for res in acl.associated_resources:
-            if res.arn in cf_by_arn:
-                resolved.append(cf_by_arn[res.arn])
-            else:
-                resolved.append(res)
-                if acl.scope == "REGIONAL":
-                    regional_by_region[acl.region].append(res)
-        acl.associated_resources = resolved
-
-    for region, resources in sorted(regional_by_region.items()):
-        unique = {res.arn: res for res in resources}
-        if unique:
-            print(f"  Resolving DNS for {len(unique)} regional resource(s) in {region}")
-            resolve_regional_resource_dns(session, region, list(unique.values()))
-
-
-def associated_resource_to_dict(
-    res: AssociatedResource, resolve_dns: bool
-) -> dict:
-    entry: dict = {"arn": res.arn}
-    if not resolve_dns:
-        return entry
-    if res.aws_hostname:
-        entry["aws_hostname"] = res.aws_hostname
-    if res.aliases:
-        entry["aliases"] = res.aliases
-    return entry
-
-
-def format_resource_dns(res: AssociatedResource) -> str:
-    parts: list[str] = []
-    if res.aws_hostname:
-        parts.append(res.aws_hostname)
-    if res.aliases:
-        parts.append(f"aliases: {', '.join(res.aliases)}")
-    return f" ({'; '.join(parts)})" if parts else ""
+            by_acl.setdefault(web_acl_id, []).append(dist["ARN"])
+    return by_acl
 
 
 def time_window(hours: int) -> tuple[datetime, datetime]:
@@ -607,12 +382,9 @@ def audit_scope(
         if scope == "REGIONAL":
             acl.associated_resources = list_regional_resources(wafv2, acl.arn)
         else:
-            distribution_arns = cf_associations.get(
+            acl.associated_resources = cf_associations.get(
                 acl.arn, cf_associations.get(acl.id, [])
             )
-            acl.associated_resources = [
-                AssociatedResource(arn=arn) for arn in distribution_arns
-            ]
 
         if include_stats and cw is not None:
             attach_rule_stats(cw, acl, lookback_hours)
@@ -632,10 +404,9 @@ def build_report(
     include_stats: bool,
     lookback_hours: int,
     capacity_limits: dict[str, int],
-    resolve_dns: bool,
 ) -> list[WafAcl]:
     print(f"Scanning CLOUDFRONT scope ({CLOUDFRONT_WAF_REGION})")
-    cf_associations, cf_by_arn = list_cloudfront_index(session)
+    cf_associations = list_cloudfront_associations(session)
     acls = audit_scope(
         session,
         "CLOUDFRONT",
@@ -659,11 +430,6 @@ def build_report(
                 capacity_limits,
             )
         )
-
-    if resolve_dns:
-        print("Resolving DNS for attached resources")
-        apply_dns_resolution(session, acls, cf_by_arn)
-
     return acls
 
 
@@ -696,7 +462,7 @@ def flatten_rule_expressions(acls: list[WafAcl]) -> list[dict]:
     return flat
 
 
-def print_summary(acls: list[WafAcl], include_stats: bool, resolve_dns: bool) -> None:
+def print_summary(acls: list[WafAcl], include_stats: bool) -> None:
     print()
     print("=" * 72)
     print(f"AWS WAF Audit Summary  ({len(acls)} Web ACL(s))")
@@ -733,9 +499,8 @@ def print_summary(acls: list[WafAcl], include_stats: bool, resolve_dns: bool) ->
                 f"allowed={acl.total_allowed}"
             )
         print(f"  Attached resources ({len(acl.associated_resources)}):")
-        for res in acl.associated_resources:
-            dns = format_resource_dns(res) if resolve_dns else ""
-            print(f"    - {res.arn}{dns}")
+        for arn in acl.associated_resources:
+            print(f"    - {arn}")
         if not acl.associated_resources:
             print("    (none — ACL is unattached)")
 
@@ -769,14 +534,6 @@ def parse_args() -> argparse.Namespace:
         help="Fetch per-rule CloudWatch traffic counters",
     )
     parser.add_argument(
-        "--resolve-dns",
-        action="store_true",
-        help=(
-            "Resolve AWS hostnames and CloudFront alternate domain names "
-            "for attached resources"
-        ),
-    )
-    parser.add_argument(
         "--lookback-hours",
         type=int,
         default=DEFAULT_LOOKBACK_HOURS,
@@ -802,21 +559,12 @@ def main() -> int:
     )
 
     acls = build_report(
-        session,
-        regions,
-        args.include_stats,
-        args.lookback_hours,
-        capacity_limits,
-        args.resolve_dns,
+        session, regions, args.include_stats, args.lookback_hours, capacity_limits
     )
 
     web_acls_view: list[dict] = []
     for acl in acls:
         acl_dict = asdict(acl)
-        acl_dict["associated_resources"] = [
-            associated_resource_to_dict(res, args.resolve_dns)
-            for res in acl.associated_resources
-        ]
         for rule_dict in acl_dict["rules"]:
             rule_dict.pop("statement", None)
             for child_dict in rule_dict.get("child_rules") or []:
@@ -827,7 +575,6 @@ def main() -> int:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "account_id": session.client("sts").get_caller_identity()["Account"],
         "include_stats": args.include_stats,
-        "resolve_dns": args.resolve_dns,
         "lookback_hours": args.lookback_hours if args.include_stats else None,
         "web_acls": web_acls_view,
         "rule_expressions": flatten_rule_expressions(acls),
@@ -835,7 +582,7 @@ def main() -> int:
     with open(args.output, "w") as f:
         json.dump(report, f, indent=2, default=str)
 
-    print_summary(acls, args.include_stats, args.resolve_dns)
+    print_summary(acls, args.include_stats)
     print()
     print(f"JSON report written to: {args.output}")
     return 0
