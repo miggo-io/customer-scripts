@@ -48,6 +48,8 @@ across every opted-in region):
 - ACL **name**, **ID**, **ARN**
 - **Scope** (`REGIONAL` or `CLOUDFRONT`)
 - **Region**
+- **Capacity** — consumed WCUs across all rules and rule groups
+- **Capacity limit** — max WCUs allowed per Web ACL for the account (from Service Quotas)
 
 ### Rules inside each ACL
 For each rule:
@@ -93,7 +95,7 @@ already reports natively — no new metrics are produced.
 - No request bodies, headers, IP addresses, or any sampled requests
 - No customer traffic data beyond aggregated counters (only when `--include-stats`)
 - No data from any service other than WAFv2, CloudFront, EC2 (regions), STS
-  (account ID), and CloudWatch (only with `--include-stats`)
+  (account ID), Service Quotas (WCU limits), and CloudWatch (only with `--include-stats`)
 - No writes, modifications, or configuration changes of any kind
 
 ---
@@ -152,8 +154,10 @@ All actions are read-only. Minimal policy:
         "ec2:DescribeRegions",
         "wafv2:ListWebACLs",
         "wafv2:GetWebACL",
+        "wafv2:GetRuleGroup",
         "wafv2:ListResourcesForWebACL",
         "cloudfront:ListDistributions",
+        "service-quotas:ListServiceQuotas",
         "sts:GetCallerIdentity"
       ],
       "Resource": "*"
@@ -197,8 +201,11 @@ Common invocations:
 # Use a named AWS profile
 ./audit.py --profile my-aws-profile
 
-# Limit to specific regions (CLOUDFRONT scope is always scanned in us-east-1)
+# Limit to specific regions (CLOUDFRONT scope is always scanned separately)
 ./audit.py --regions us-east-1,eu-west-1
+
+# Use a different region for global API calls (region discovery, Service Quotas)
+./audit.py --default-region eu-west-1
 
 # Include 24h CloudWatch traffic counters
 ./audit.py --include-stats
@@ -215,6 +222,7 @@ Common invocations:
 | Flag | Description |
 |------|-------------|
 | `--profile PROFILE` | AWS profile name (default: standard credential chain) |
+| `--default-region REGION` | Region for global API calls — region discovery (`ec2:DescribeRegions`) and WCU limit lookup (`service-quotas:ListServiceQuotas`). Default: `us-east-1`. Does not affect which regions are scanned for `REGIONAL` WAF scope, and does not change the CloudFront WAF endpoint (always `us-east-1`). |
 | `--regions REGIONS` | Comma-separated regions for `REGIONAL` scope (default: all opted-in regions) |
 | `--output PATH` | Path for the JSON report (default: `aws_waf_audit_<UTC-timestamp>.json`) |
 | `--include-stats` | Also fetch per-rule CloudWatch traffic counters |
@@ -239,6 +247,8 @@ Common invocations:
       "arn": "arn:aws:wafv2:us-east-1:123456789012:regional/webacl/...",
       "scope": "REGIONAL",
       "region": "us-east-1",
+      "capacity": 847,
+      "capacity_limit": 5000,
       "rules": [
         {
           "name": "block-bad-ips",
@@ -303,6 +313,7 @@ AWS WAF Audit Summary  (3 Web ACL(s))
 
 [CLOUDFRONT] cf-acl  (us-east-1)
   ARN: arn:aws:wafv2:global:.../webacl/...
+  Capacity: 1200 / 5000 WCUs
   Rules: 4
     - [  0] NONE  managed    AWS-AWSManagedRulesCommonRuleSet
     - [  1] BLOCK regular    block-bad-ips
@@ -318,6 +329,7 @@ counters and an extra `Totals (24h)` line is printed per ACL:
 ```
 [CLOUDFRONT] cf-acl  (us-east-1)
   ARN: arn:aws:wafv2:global:.../webacl/...
+  Capacity: 1200 / 5000 WCUs
   Rules: 4
     - [  0] NONE  managed    AWS-AWSManagedRulesCommonRuleSet  blocked=0 allowed=12345 counted=0
     - [  1] BLOCK regular    block-bad-ips                     blocked=87 allowed=0 counted=0
