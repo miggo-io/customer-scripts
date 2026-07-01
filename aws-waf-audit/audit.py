@@ -22,11 +22,13 @@ Required IAM permissions (all read-only):
   - wafv2:ListResourcesForWebACL
   - cloudfront:ListDistributions
   - cloudwatch:GetMetricStatistics            (only with --include-stats)
+  - service-quotas:ListServiceQuotas          (Web ACL WCU limit lookup)
 
 Usage:
   python audit.py
   python audit.py --profile my-profile --output waf.json
   python audit.py --regions us-east-1,eu-west-1 --include-stats
+  python audit.py --default-region eu-west-1
   python audit.py --include-stats --lookback-hours 168
 """
 
@@ -43,7 +45,21 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 CLOUDWATCH_NAMESPACE = "AWS/WAFV2"
 CLOUDWATCH_PERIOD = 86400
+DEFAULT_REGION = "us-east-1"
 DEFAULT_LOOKBACK_HOURS = 24
+DEFAULT_WEB_ACL_WCU_LIMIT = 5000
+WAFV2_SERVICE_CODE = "wafv2"
+WEB_ACL_WCU_QUOTA_NAMES = {
+    "CLOUDFRONT": (
+        "Maximum number of web ACL capacity units in a web ACL in WAF for CloudFront"
+    ),
+    "REGIONAL": (
+        "Maximum number of web ACL capacity units in a web ACL in WAF for regional"
+    ),
+}
+
+# WAFv2 CLOUDFRONT scope is only available via the us-east-1 endpoint.
+CLOUDFRONT_WAF_REGION = DEFAULT_REGION
 
 REGIONAL_RESOURCE_TYPES = [
     "APPLICATION_LOAD_BALANCER",
@@ -76,6 +92,8 @@ class WafAcl:
     arn: str
     scope: str
     region: str
+    capacity: int | None = None
+    capacity_limit: int | None = None
     rules: list[WafRule] = field(default_factory=list)
     associated_resources: list[str] = field(default_factory=list)
     total_blocked: int | None = None
@@ -153,14 +171,56 @@ def expand_custom_rule_groups(wafv2, rules: list[WafRule]) -> None:
             )
 
 
-def discover_regions(session: boto3.Session) -> list[str]:
-    ec2 = session.client("ec2", region_name="us-east-1")
+def discover_regions(
+    session: boto3.Session, default_region: str = DEFAULT_REGION
+) -> list[str]:
+    ec2 = session.client("ec2", region_name=default_region)
     response = ec2.describe_regions(
         Filters=[
             {"Name": "opt-in-status", "Values": ["opt-in-not-required", "opted-in"]}
         ]
     )
     return sorted(r["RegionName"] for r in response.get("Regions", []))
+
+
+def fetch_web_acl_capacity_limits(
+    session: boto3.Session, region: str = DEFAULT_REGION
+) -> dict[str, int]:
+    """Return max WCUs per Web ACL for each WAF scope (account quota)."""
+    limits = {scope: DEFAULT_WEB_ACL_WCU_LIMIT for scope in WEB_ACL_WCU_QUOTA_NAMES}
+    sq = session.client("service-quotas", region_name=region)
+    quotas: list[dict] = []
+    try:
+        paginator = sq.get_paginator("list_service_quotas")
+        for page in paginator.paginate(ServiceCode=WAFV2_SERVICE_CODE):
+            quotas.extend(page.get("Quotas", []))
+    except (ClientError, BotoCoreError) as exc:
+        print(
+            f"warning: could not fetch Web ACL WCU limits via Service Quotas "
+            f"({region}); using default {DEFAULT_WEB_ACL_WCU_LIMIT}: {exc}",
+            file=sys.stderr,
+        )
+        return limits
+
+    for scope, quota_name in WEB_ACL_WCU_QUOTA_NAMES.items():
+        match = next((q for q in quotas if q.get("QuotaName") == quota_name), None)
+        if match is None:
+            print(
+                f"warning: WCU quota not found for {scope} scope; "
+                f"using default {DEFAULT_WEB_ACL_WCU_LIMIT}",
+                file=sys.stderr,
+            )
+            continue
+        limits[scope] = int(match["Value"])
+    return limits
+
+
+def format_capacity_usage(acl: WafAcl) -> str:
+    if acl.capacity is None:
+        return ""
+    if acl.capacity_limit is not None:
+        return f", {acl.capacity}/{acl.capacity_limit} WCUs"
+    return f", {acl.capacity} WCUs"
 
 
 def list_web_acls(wafv2, scope: str) -> list[dict]:
@@ -178,12 +238,15 @@ def list_web_acls(wafv2, scope: str) -> list[dict]:
     return acls
 
 
-def fetch_acl_rules(wafv2, name: str, acl_id: str, scope: str) -> list[WafRule]:
+def fetch_acl_details(
+    wafv2, name: str, acl_id: str, scope: str
+) -> tuple[list[WafRule], int | None]:
     response = wafv2.get_web_acl(Name=name, Scope=scope, Id=acl_id)
-    raw_rules = response.get("WebACL", {}).get("Rules", [])
+    web_acl = response.get("WebACL", {}) or {}
+    raw_rules = web_acl.get("Rules", [])
     rules = [parse_rule(r) for r in raw_rules]
     expand_custom_rule_groups(wafv2, rules)
-    return rules
+    return rules, web_acl.get("Capacity")
 
 
 def list_regional_resources(wafv2, acl_arn: str) -> list[str]:
@@ -260,7 +323,7 @@ def metric_sum(
 
 
 def attach_rule_stats(cw, acl: WafAcl, hours: int) -> None:
-    cw_region = "us-east-1" if acl.scope == "CLOUDFRONT" else acl.region
+    cw_region = CLOUDFRONT_WAF_REGION if acl.scope == "CLOUDFRONT" else acl.region
     for rule in acl.rules:
         rule.blocked = metric_sum(
             cw, acl.name, cw_region, rule.metric_name, "BlockedRequests", hours
@@ -286,6 +349,7 @@ def audit_scope(
     cf_associations: dict[str, list[str]],
     include_stats: bool,
     lookback_hours: int,
+    capacity_limits: dict[str, int],
 ) -> list[WafAcl]:
     wafv2 = session.client("wafv2", region_name=region)
     cw = session.client("cloudwatch", region_name=region) if include_stats else None
@@ -308,9 +372,10 @@ def audit_scope(
             arn=raw["ARN"],
             scope=scope,
             region=region,
+            capacity_limit=capacity_limits.get(scope),
         )
         try:
-            acl.rules = fetch_acl_rules(wafv2, acl.name, acl.id, scope)
+            acl.rules, acl.capacity = fetch_acl_details(wafv2, acl.name, acl.id, scope)
         except (ClientError, BotoCoreError) as exc:
             print(f"    error: get_web_acl({acl.name}): {exc}", file=sys.stderr)
 
@@ -326,7 +391,7 @@ def audit_scope(
 
         audited.append(acl)
         print(
-            f"    - {acl.name} ({len(acl.rules)} rules, "
+            f"    - {acl.name} ({len(acl.rules)} rules{format_capacity_usage(acl)}, "
             f"{len(acl.associated_resources)} attached resources)"
         )
 
@@ -338,23 +403,31 @@ def build_report(
     regions: list[str],
     include_stats: bool,
     lookback_hours: int,
+    capacity_limits: dict[str, int],
 ) -> list[WafAcl]:
-    print(f"Scanning CLOUDFRONT scope (us-east-1)")
+    print(f"Scanning CLOUDFRONT scope ({CLOUDFRONT_WAF_REGION})")
     cf_associations = list_cloudfront_associations(session)
     acls = audit_scope(
         session,
         "CLOUDFRONT",
-        "us-east-1",
+        CLOUDFRONT_WAF_REGION,
         cf_associations,
         include_stats,
         lookback_hours,
+        capacity_limits,
     )
 
     print(f"Scanning REGIONAL scope across {len(regions)} regions")
     for region in regions:
         acls.extend(
             audit_scope(
-                session, "REGIONAL", region, {}, include_stats, lookback_hours
+                session,
+                "REGIONAL",
+                region,
+                {},
+                include_stats,
+                lookback_hours,
+                capacity_limits,
             )
         )
     return acls
@@ -398,6 +471,11 @@ def print_summary(acls: list[WafAcl], include_stats: bool) -> None:
         print()
         print(f"[{acl.scope}] {acl.name}  ({acl.region})")
         print(f"  ARN: {acl.arn}")
+        if acl.capacity is not None:
+            if acl.capacity_limit is not None:
+                print(f"  Capacity: {acl.capacity} / {acl.capacity_limit} WCUs")
+            else:
+                print(f"  Capacity: {acl.capacity} WCUs")
         print(f"  Rules: {len(acl.rules)}")
         for rule in acl.rules:
             stats = ""
@@ -433,6 +511,15 @@ def parse_args() -> argparse.Namespace:
         "--profile", help="AWS profile name (default: standard credential chain)"
     )
     parser.add_argument(
+        "--default-region",
+        default=DEFAULT_REGION,
+        help=(
+            f"AWS region for global API calls such as region discovery and "
+            f"Service Quotas (default: {DEFAULT_REGION}). "
+            f"CLOUDFRONT WAF scope is always scanned in {CLOUDFRONT_WAF_REGION}."
+        ),
+    )
+    parser.add_argument(
         "--regions",
         help="Comma-separated regions for REGIONAL scope (default: all opted-in)",
     )
@@ -462,9 +549,18 @@ def main() -> int:
     if args.regions:
         regions = [r.strip() for r in args.regions.split(",") if r.strip()]
     else:
-        regions = discover_regions(session)
+        regions = discover_regions(session, args.default_region)
 
-    acls = build_report(session, regions, args.include_stats, args.lookback_hours)
+    capacity_limits = fetch_web_acl_capacity_limits(session, args.default_region)
+    print(
+        "Web ACL WCU limits: "
+        f"CLOUDFRONT={capacity_limits['CLOUDFRONT']}, "
+        f"REGIONAL={capacity_limits['REGIONAL']}"
+    )
+
+    acls = build_report(
+        session, regions, args.include_stats, args.lookback_hours, capacity_limits
+    )
 
     web_acls_view: list[dict] = []
     for acl in acls:
